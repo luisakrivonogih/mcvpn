@@ -1,0 +1,62 @@
+# Plugin channel the tunnel byte-transport rides on. Must match the mcvpn
+# client's TUNNEL_CHANNEL constant (client/src/mc/session.rs).
+channel: "mcvpn:tunnel"
+
+# Suppresses the "X joined/left the game" chat and console broadcasts for
+# every connecting player. On a server that only exists to host tunnel
+# connections, those messages are pure noise.
+silence-join-quit-messages: true
+
+# Optional further hop: instead of connecting straight to the target a
+# stream asked for, connect to this HTTP proxy and issue a CONNECT for the
+# real target through it. Useful for routing final egress through another
+# proxy (geographic exit, additional hop, etc). Leave disabled for direct
+# internet egress from this server.
+upstream:
+  enabled: false
+  host: "127.0.0.1"
+  port: 3128
+
+# Every new connection authenticates with an X25519 ephemeral-key handshake
+# presenting a per-user key_id, MACed by that user's own secret, then talks
+# ChaCha20-Poly1305 using session keys derived from that handshake -- not
+# directly from the secret, so a future leak of a user's secret can't be
+# used to decrypt a recorded past session (see TunnelCrypto.java).
+# Anything that fails the handshake -- unknown key_id, disabled user, bad
+# MAC -- is silently dropped: no kick, no error, no observable reaction.
+# key_id/secret pairs are per-user now (see below) instead of one global
+# passphrase; manage them with `/mcvpn user create|revoke|list` or the
+# admin HTTP API once at least one admin account exists
+# (`/mcvpn admin create`).
+database:
+  # memory (default, non-persistent, zero-config) | postgres | mariadb | mongodb
+  type: "memory"
+  host: "127.0.0.1"
+  port: 5432
+  name: "mcvpn"
+  user: "mcvpn"
+  password: ""
+
+# Embedded HTTP API the SvelteKit admin panel's backend talks to for
+# managing admin accounts and per-user tunnel credentials. Trust model:
+# this is meant to be reached ONLY from the same host (or a private
+# network you otherwise trust), never exposed directly to the internet --
+# there is no CORS handling and no rate limiting here, only bearer-token
+# session auth. Keep `bind` at loopback unless the panel's backend runs on
+# a different, still-trusted host, in which case bind to a private
+# interface and firewall off everything else. Bootstrap the first admin
+# account with `/mcvpn admin create <username> <password>` before this API
+# is useful for anything.
+#
+# First-run convenience: if NO admin accounts exist yet at startup, mcvpn
+# automatically creates one for you (username `admin`, password `admin`)
+# so a fresh install always has a way to log in -- you don't have to run
+# `/mcvpn admin create` by hand first. This is loudly re-warned on every
+# server start for as long as an account named `admin` exists, since it's
+# a standing security risk. Log in, change its password or create another
+# admin account and delete this one, before exposing this API beyond
+# localhost.
+admin-api:
+  enabled: true
+  bind: "127.0.0.1"
+  port: 8081

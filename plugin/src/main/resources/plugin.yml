@@ -1,0 +1,38 @@
+name: McvpnPlugin
+version: 0.1.0
+main: dev.mcvpn.plugin.McvpnPlugin
+api-version: '1.20'
+author: mcvpn
+description: >
+  Minecraft-tunnel server side: receives tunnel-channel plugin messages from
+  the mcvpn client and forwards the payload to a local TCP target.
+
+commands:
+  mcvpn:
+    description: Manage mcvpn admin accounts and per-user tunnel credentials. Console-only.
+    usage: >
+      /mcvpn admin create <username> <password> | admin list | user list |
+      user create <label> | user revoke <keyId>
+    # No player should ever see this command exists (not even an op) -- see
+    # McvpnCommand's class doc for the full rationale. `mcvpn.console` is
+    # `default: false` below (nobody has it, including ops) purely so
+    # Bukkit's own tab-completion/`/help` filtering hides it from every
+    # player; the console bypasses permission checks entirely in Bukkit, so
+    # this alone is enough for console access to keep working. The command
+    # code enforces the real console-only check itself regardless of this
+    # permission's value.
+    permission: mcvpn.console
+    permission-message: 'Unknown command. Type "/help" for help.'
+  list:
+    description: >
+      Overrides vanilla /list to exclude active tunnel connections, the same
+      way they're already excluded from the tab list and server-list ping.
+    usage: /list
+
+permissions:
+  mcvpn.console:
+    description: >
+      Intentionally never granted to any player (see the mcvpn command
+      entry above) -- exists only so Bukkit hides /mcvpn from tab-completion
+      and /help for players. Console access does not depend on this.
+    default: false

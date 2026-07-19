@@ -1,0 +1,42 @@
+# mcvpn client configuration.
+#
+# Copy this file to config.toml (in the directory you run the client from,
+# or anywhere -- pass the path as the first CLI argument, e.g.
+# `./client /etc/mcvpn/config.toml`) and fill in key_id/key_secret below.
+# config.toml is gitignored; config.example.toml (this file) is the
+# checked-in template and should not contain real credentials.
+
+# The Minecraft (Paper) server this transport tunnels through -- i.e. the
+# mcvpn plugin's host/port, not the final destination your traffic is
+# proxied to.
+server_host = "127.0.0.1"
+server_port = 25565
+
+# Prefix for the per-connection offline-mode username. Each new tunnel gets
+# a unique generated suffix appended so concurrent CONNECTs don't collide on
+# a duplicate login. Rarely needs changing.
+username_prefix = "mcvpn_"
+
+# Local address the HTTP CONNECT proxy listens on. Point your
+# browser/application's HTTP(S) proxy setting at this address.
+proxy_listen = "127.0.0.1:8080"
+
+# Local address the SOCKS5 proxy listens on. Use this instead of
+# proxy_listen for anything that doesn't speak HTTP CONNECT (torrent
+# clients, chat apps, `curl --socks5`, etc.) -- it tunnels any TCP traffic,
+# not just HTTP(S).
+socks_listen = "127.0.0.1:1080"
+
+# Per-user credentials issued by the admin panel (or `/mcvpn user create`
+# on the server plugin). key_id identifies which user record the plugin
+# looks up on every handshake; key_secret keys the handshake MACs and is
+# never sent in the clear. Both are required -- there is no default -- and
+# must exactly match a key_id/secret pair the admin issued for this client.
+#
+# key_id: 16 bytes, as 32 hex characters.
+# key_secret: 32 bytes, as 64 hex characters.
+#
+# Treat key_secret like a password: anyone who obtains it can use your
+# tunnel allowance and impersonate this client on the handshake.
+key_id = "00112233445566778899aabbccddeeff"
+key_secret = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"

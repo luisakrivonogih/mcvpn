@@ -1,0 +1,21 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+chacha20poly1305 = "0.10"
+futures = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+toml = "0.8"
+valence_protocol = { version = "0.2.0-alpha.1", features = ["compression", "encryption"] }
+x25519-dalek = "2"
