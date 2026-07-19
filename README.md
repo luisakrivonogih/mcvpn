@@ -1,16 +1,52 @@
 # mcvpn
 
-An application-level TCP tunnel whose wire traffic is a real Minecraft session.
+An application-level encrypted TCP tunnel carried over a real Minecraft protocol session.
 
-mcvpn is **not** a TUN/TAP VPN. It doesn't touch routing tables, doesn't need root/admin, and doesn't create a virtual network interface. It's a multiplexed, encrypted tunnel that happens to move its bytes by actually speaking the Minecraft protocol — a real Handshake, a real (offline-mode) Login, a real Play state, a real plugin channel — against a real Paper server. To anything watching the network, it's indistinguishable from someone playing Minecraft, because it *is* someone playing Minecraft.
+mcvpn is **not** a TUN/TAP VPN. It doesn't touch routing tables, doesn't need root/admin, and doesn't create a virtual network interface. It's a multiplexed, encrypted tunnel that happens to move its bytes by actually speaking the Minecraft protocol — a real Handshake, a real (offline-mode) Login, a real Play state, a real plugin channel — against a real Paper server. It's designed so that, to anything watching the network, it looks like someone playing Minecraft, because it *is* a real Minecraft session underneath.
+
+## Features
+
+- No TUN/TAP, no root/admin required — it's a userspace proxy, not a virtual network interface
+- HTTP CONNECT **and** SOCKS5 front ends, so it carries any TCP traffic, not just HTTP(S)
+- Multiplexed streams over a single Minecraft connection, with per-stream flow control
+- Wire traffic is a real Minecraft 1.20.1 handshake/login/play session, not a lookalike protocol
+- Forward-secret handshake (X25519 + HKDF-SHA256) and ChaCha20-Poly1305 per-frame encryption, with periodic session-key rotation
+- Per-user credentials (not one shared passphrase), on a pluggable store: memory, Postgres, MariaDB, or MongoDB
+- Web admin panel: manage users/credentials, live online status, one-click client config download
 
 ```
-your app ─▶ local HTTP CONNECT proxy ─▶ Rust client ─▶ [Minecraft protocol, port 25565] ─▶ Paper server + plugin ─▶ real TCP target
+    app
+     │
+     ▼
+HTTP CONNECT / SOCKS5  (proxy_listen / socks_listen)
+     │
+     ▼
+  mcvpn client (Rust)
+     │
+     ▼
+Minecraft protocol, port 25565
+     │
+     ▼
+Paper server + mcvpn plugin
+     │
+     ▼
+  target TCP service
 ```
 
 ## Why
 
 Traffic that looks like an encrypted VPN protocol is an easy pattern to flag. Traffic that looks like a video game is not. mcvpn pushes an ordinary multiplexed, authenticated, encrypted tunnel through a transport that is, byte for byte, a legitimate Minecraft connection — handshake, login, keep-alives, plugin channel registration and all.
+
+### How this compares
+
+|  | mcvpn | Plain VPN (WireGuard, OpenVPN) | Generic obfuscated tunnel (Shadowsocks, V2Ray) |
+|---|---|---|---|
+| Wire format | A real Minecraft session | Its own recognizable protocol | Encrypted, protocol-agnostic-looking traffic |
+| Looks like a specific, everyday app | Yes — a game client | No | No — looks like "something encrypted," not like a specific app |
+| Requires TUN/TAP or root | No | Usually yes | No |
+| Proxy interface | HTTP CONNECT + SOCKS5 | N/A (routes at the OS network layer) | Usually SOCKS5 |
+
+Plain VPN protocols aren't trying to disguise *what* they are — they're built for performance and correctness, and rely on being permitted or on separate obfuscation layers when they're not. Generic obfuscators hide content but still tend to produce traffic that just looks like "something encrypted," which is itself a pattern some inspection can key on. mcvpn's bet is narrower and different: instead of looking like nothing in particular, look like a specific, extremely common, ordinary consumer application.
 
 ## How it's built
 
@@ -18,14 +54,14 @@ Four pieces, one repo:
 
 | Directory | What | Stack |
 |---|---|---|
-| [`client/`](client/) | The tunnel client: HTTP CONNECT proxy in front, real Minecraft client behind | Rust, Tokio, `valence_protocol` |
+| [`client/`](client/) | The tunnel client: HTTP CONNECT + SOCKS5 proxies in front, real Minecraft client behind | Rust, Tokio, `valence_protocol` |
 | [`plugin/`](plugin/) | Server-side Paper plugin: authenticates, decrypts, demultiplexes to real TCP targets | Java 17+, Paper API 1.20.1 |
 | [`panel/`](panel/) | Admin web UI for managing users/credentials against the plugin's HTTP API | SvelteKit 2, Svelte 5, TypeScript |
 | `server/` | *(gitignored, not shipped)* a local Paper server used for manual end-to-end testing during development | — |
 
 ### Client (`client/`)
 
-Drives the actual Minecraft session and exposes a local HTTP CONNECT proxy:
+Drives the actual Minecraft session and exposes local HTTP CONNECT + SOCKS5 proxies:
 
 - `mc/` — Handshake → Login → (no-op Configuration stub, since protocol 763/1.20.1 predates that state) → Play, then registers the tunnel's plugin channel like a real modded client would (`mc/session.rs`, `mc/play.rs`).
 - `net/` — pure wire framing: a `tokio_util` `Decoder`/`Encoder` wrapping `valence_protocol`'s packet (de)serialization, compression-aware, with zero game-state knowledge (`net/codec.rs`).
@@ -101,11 +137,13 @@ plugin → client:  epk_s(32B) || mac2(32B)
 
 ### Stealth behavior
 
-A connection that never completes the handshake — wrong key, no key, or just a stray TCP client poking the port — is a completely ordinary Minecraft login. It joins, it's a normal player, nothing about the server's behavior reveals the plugin is even installed. No kick, no error packet, no log line visible to the network.
+This is designed to resist casual and automated inspection, not to guarantee anonymity against a determined, targeted analyst — the design goal is "closely resembles ordinary Minecraft traffic to anything watching the wire," not an unfalsifiable claim that no observable difference exists anywhere.
+
+A connection that never completes the handshake — wrong key, no key, or just a stray TCP client poking the port — is designed to look like a completely ordinary Minecraft login. It joins, it's a normal player, and the server's behavior aims to give no sign the plugin is even installed: no kick, no error packet, no log line visible to the network.
 
 A connection that *does* authenticate gets hidden the instant the handshake completes — switched to spectator mode and removed from every other online player's tab list and view distance (and vice versa — real players don't see it either), whether or not it's already sent any real traffic yet. Authenticating at all is proof enough it's not a real player; it never gets a chance to sit visible in anyone's tab list first.
 
-This also covers the unauthenticated `ServerListPing` (the MOTD/player-sample query any Minecraft client sends before joining, no connection required) — active tunnel connections are stripped out of both the player-count and the name sample, so an outside observer who just pings the server sees a normal player count and normal names, never a tunnel account.
+This also covers the unauthenticated `ServerListPing` (the MOTD/player-sample query any Minecraft client sends before joining, no connection required) — active tunnel connections are stripped out of both the player-count and the name sample, so an outside observer who just pings the server sees a normal-looking player count and name sample, with no tunnel account in it.
 
 `/list` is overridden the same way (Bukkit lets a plugin's `plugin.yml` command take over a vanilla command by name) to exclude active tunnel connections too — identically whether it's run by a player or from console, since there's no separate "real" answer being hidden from one but not the other.
 
