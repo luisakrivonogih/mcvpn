@@ -24,13 +24,16 @@ import dev.mcvpn.plugin.store.VpnUser;
  *
  * No player -- not even an op -- may see or run this. {@code plugin.yml}
  * gates it behind a {@code default: false} permission so it's invisible in
- * tab-completion and {@code /help} for every player (console always bypasses
- * permission checks in Bukkit, so this alone would already be enough), but
- * {@link #onCommand} enforces the sender-type check itself too: a mcvpn
- * player-facing surface that ever revealed this plugin's admin command
- * exists would be exactly the kind of DPI-visible tell the whole project is
- * built to avoid on the wire, so this isn't left to permission
- * configuration alone.
+ * tab-completion and {@code /help} for every player. That same
+ * {@code default: false} also blocks the console (a {@code default: false}
+ * permission is unconditionally false regardless of op status, and console
+ * only auto-passes {@code default: op} checks), so {@code McvpnPlugin
+ * #onEnable} explicitly attaches the permission to the console sender to
+ * compensate. {@link #onCommand} enforces the sender-type check itself too,
+ * independent of all of that: a mcvpn player-facing surface that ever
+ * revealed this plugin's admin command exists would be exactly the kind of
+ * DPI-visible tell the whole project is built to avoid on the wire, so this
+ * isn't left to permission configuration alone.
  *
  * {@link UserStore} is entirely asynchronous, but this handler runs on the
  * console thread that issued the command rather than the hot connection

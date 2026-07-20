@@ -8,6 +8,7 @@ use serde::Deserialize;
 /// positional CLI args or a pile of env vars: it's the path to the file
 /// (given as the first CLI argument, defaulting to `./config.toml`) that's
 /// passed on the command line, not the settings themselves.
+#[derive(Clone)]
 pub struct ClientConfig {
     /// The Minecraft (Paper) server this transport tunnels through.
     pub server_host: String,

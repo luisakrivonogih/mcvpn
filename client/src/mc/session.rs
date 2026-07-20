@@ -9,9 +9,10 @@ use tokio::task::JoinHandle;
 use valence_protocol::uuid::Uuid;
 
 use crate::config::ClientConfig;
+use crate::mc::camouflage::{self, IdleSimulator};
 use crate::mc::packets::{
     CustomPayloadC2s, CustomPayloadS2c, DisconnectS2c, Ident, KeepAliveC2s, KeepAliveS2c, Packet,
-    RawBytes,
+    PlayerPositionLookS2c, RawBytes, TeleportConfirmC2s,
 };
 use crate::mc::{configuration, handshake, login, play};
 use crate::net::framed::{self, McFramed};
@@ -62,6 +63,9 @@ impl Session {
         let login = login::perform(&mut framed, &username).await?;
         configuration::run().await;
         let play_info = play::await_join(&mut framed).await?;
+        // A real client sends this immediately on entering Play, before
+        // announcing any plugin channels -- see `mc::camouflage`.
+        framed.send(&camouflage::client_settings()).await?;
         play::register_channel(&mut framed, TUNNEL_CHANNEL).await?;
 
         Ok(Self {
@@ -81,7 +85,7 @@ impl Session {
         let (outbound_tx, outbound_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (inbound_tx, inbound_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
-        let join = tokio::spawn(run_actor(self.framed, outbound_rx, inbound_tx));
+        let join = tokio::spawn(run_actor(self.framed, self.entity_id, outbound_rx, inbound_tx));
 
         Tunnel {
             sender: FrameSender(outbound_tx),
@@ -93,33 +97,73 @@ impl Session {
 
 async fn run_actor(
     mut framed: McFramed,
+    entity_id: i32,
     mut outbound_rx: mpsc::Receiver<Bytes>,
     inbound_tx: mpsc::Sender<Bytes>,
 ) {
+    // Facing starts at (0, 0) and gets corrected the moment the server's
+    // spawn teleport (`PlayerPositionLookS2c`) arrives below -- it always
+    // does, before anything else worth reacting to.
+    let mut idle = IdleSimulator::new(entity_id, 0.0, 0.0);
+    let idle_timer = tokio::time::sleep(idle.next_delay());
+    tokio::pin!(idle_timer);
+
     loop {
         tokio::select! {
+            () = &mut idle_timer => {
+                let sent = match idle.next_action() {
+                    camouflage::Action::Look(pkt) => framed.send(&pkt).await,
+                    camouflage::Action::Swing(pkt) => framed.send(&pkt).await,
+                    camouflage::Action::Sneak(pkt) => framed.send(&pkt).await,
+                };
+                if let Err(e) = sent {
+                    eprintln!("[mc] failed to send idle camouflage packet: {e:#}");
+                    break;
+                }
+                idle_timer.as_mut().reset(tokio::time::Instant::now() + idle.next_delay());
+            }
+
             payload = outbound_rx.recv() => {
                 let Some(payload) = payload else {
                     // The caller dropped its sender: nothing left to relay
                     // outward. `Tunnel::join.abort()` (or this same
                     // channel-closed check on the inbound side) tears the
                     // rest down.
+                    eprintln!("[mc] local tunnel handle dropped, closing connection");
                     break;
                 };
                 if payload.len() > MAX_FRAME_LEN {
+                    eprintln!(
+                        "[mc] outbound frame of {} bytes exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN}), closing connection",
+                        payload.len()
+                    );
                     break;
                 }
                 let Ok(channel) = Ident::new(TUNNEL_CHANNEL) else { break };
                 let packet = CustomPayloadC2s { channel, data: RawBytes(&payload) };
-                if framed.send(&packet).await.is_err() {
+                if let Err(e) = framed.send(&packet).await {
+                    eprintln!("[mc] failed to write to the minecraft connection: {e:#}");
                     break;
                 }
             }
             frame = framed.next() => {
-                let Some(Ok(frame)) = frame else { break };
+                let frame = match frame {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(e)) => {
+                        eprintln!("[mc] connection error while reading: {e:#}");
+                        break;
+                    }
+                    None => {
+                        eprintln!("[mc] server closed the connection");
+                        break;
+                    }
+                };
                 match frame.id {
                     CustomPayloadS2c::ID => {
-                        let Ok(pkt) = frame.decode::<CustomPayloadS2c>() else { break };
+                        let Ok(pkt) = frame.decode::<CustomPayloadS2c>() else {
+                            eprintln!("[mc] failed to decode a CustomPayload packet, closing connection");
+                            break;
+                        };
                         if pkt.channel.as_str() == TUNNEL_CHANNEL
                             && inbound_tx.send(Bytes::copy_from_slice(pkt.data.0)).await.is_err()
                         {
@@ -127,12 +171,38 @@ async fn run_actor(
                         }
                     }
                     KeepAliveS2c::ID => {
-                        let Ok(pkt) = frame.decode::<KeepAliveS2c>() else { break };
-                        if framed.send(&KeepAliveC2s { id: pkt.id }).await.is_err() {
+                        let Ok(pkt) = frame.decode::<KeepAliveS2c>() else {
+                            eprintln!("[mc] failed to decode a KeepAlive packet, closing connection");
+                            break;
+                        };
+                        if let Err(e) = framed.send(&KeepAliveC2s { id: pkt.id }).await {
+                            eprintln!("[mc] failed to reply to KeepAlive: {e:#}");
                             break;
                         }
                     }
-                    DisconnectS2c::ID => break,
+                    DisconnectS2c::ID => {
+                        match frame.decode::<DisconnectS2c>() {
+                            Ok(pkt) => eprintln!("[mc] server disconnected us: {}", pkt.reason),
+                            Err(_) => eprintln!("[mc] server disconnected us (reason unreadable)"),
+                        }
+                        break;
+                    }
+                    PlayerPositionLookS2c::ID => {
+                        // A real client always acks this, on the initial
+                        // spawn teleport and any later one; skipping it is
+                        // itself a tell. Also resync our idle look-wobble
+                        // baseline so it starts from where the server
+                        // actually thinks we're facing.
+                        let Ok(pkt) = frame.decode::<PlayerPositionLookS2c>() else {
+                            eprintln!("[mc] failed to decode a PlayerPositionLook packet, closing connection");
+                            break;
+                        };
+                        idle.resync(pkt.yaw, pkt.pitch);
+                        if let Err(e) = framed.send(&TeleportConfirmC2s { teleport_id: pkt.teleport_id }).await {
+                            eprintln!("[mc] failed to send teleport confirm: {e:#}");
+                            break;
+                        }
+                    }
                     _ => {}
                 }
             }

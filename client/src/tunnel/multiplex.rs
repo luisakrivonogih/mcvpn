@@ -19,11 +19,12 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, ensure};
 use bytes::Bytes;
 use rand::Rng;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::config::ClientConfig;
 use crate::crypto::cipher::{self, ConnectionId, SessionCrypto};
-use crate::mc::session::{FrameReceiver, FrameSender, Tunnel};
+use crate::mc::session::{FrameReceiver, FrameSender, Session, Tunnel};
 
 use super::frame::{CONTROL_STREAM, Frame, FrameType};
 use super::stream::{StreamReceiver, StreamSender, StreamShared};
@@ -60,8 +61,18 @@ fn next_rotation_delay() -> Duration {
     (ROTATION_INTERVAL - ROTATION_JITTER) + Duration::from_secs(jitter_secs)
 }
 
+/// The multiplexer's view of its underlying Minecraft connection: either
+/// there's a live one accepting new streams, or the supervisor is between
+/// connections and callers should fail fast rather than queue up behind a
+/// connection that might not come back for a while (see `spawn`'s docs).
+#[derive(Clone)]
+enum ConnState {
+    Connecting,
+    Connected(mpsc::Sender<OpenRequest>),
+}
+
 pub struct Multiplexer {
-    open_tx: mpsc::Sender<OpenRequest>,
+    state_rx: watch::Receiver<ConnState>,
 }
 
 struct OpenRequest {
@@ -75,24 +86,34 @@ struct StreamEntry {
 }
 
 impl Multiplexer {
-    /// Takes ownership of an already-connected `Tunnel`, runs the
-    /// authenticated ephemeral-key handshake over it, and starts the
-    /// background actor once that succeeds.
+    /// Establishes the Minecraft connection (handshake and all), retrying
+    /// with backoff so a transient network hiccup doesn't require restarting
+    /// the whole client before the first browser request -- then keeps a
+    /// background supervisor running for the rest of the process's life that
+    /// transparently reconnects (again with backoff) whenever that
+    /// connection later dies, from a server restart, a network drop, or
+    /// anything else.
     ///
-    /// Fails if the plugin doesn't reply within `HANDSHAKE_TIMEOUT` or its
-    /// reply doesn't authenticate -- both symptoms of a key_id/secret
-    /// mismatch, since a plugin that doesn't recognize our handshake stays
-    /// completely silent rather than sending back an error (see
-    /// `crypto::cipher`'s module docs for why).
-    pub async fn spawn(tunnel: Tunnel, key_id: cipher::KeyId, secret: Vec<u8>) -> Result<Self> {
-        let Tunnel { sender, mut receiver, join } = tunnel;
+    /// Reconnecting can't resume streams that were open on the old
+    /// connection -- there is no way to tell the plugin "continue where we
+    /// left off" without it keeping per-stream state around for a
+    /// connection that's already gone, so those simply end (their
+    /// `StreamReceiver::recv()` returns `None`, same as any other close) and
+    /// the local proxied socket closes with them. `open_stream` calls made
+    /// while a reconnect is in flight fail immediately with a clear error
+    /// instead of queueing indefinitely behind a connection attempt that,
+    /// on a wrong credential, would otherwise never succeed.
+    pub async fn spawn(config: ClientConfig) -> Self {
+        let (state_tx, mut state_rx) = watch::channel(ConnState::Connecting);
+        tokio::spawn(supervise(config, state_tx));
 
-        let crypto = perform_handshake(&sender, &mut receiver, &key_id, &secret).await?;
+        while matches!(*state_rx.borrow(), ConnState::Connecting) {
+            if state_rx.changed().await.is_err() {
+                break;
+            }
+        }
 
-        let (open_tx, open_rx) = mpsc::channel(QUEUE_CAPACITY);
-        tokio::spawn(run(sender, receiver, join, crypto, secret, open_rx));
-
-        Ok(Self { open_tx })
+        Self { state_rx }
     }
 
     /// Opens a new logical stream to `target` (`"host:port"`).
@@ -102,13 +123,68 @@ impl Multiplexer {
     /// returned `StreamReceiver::recv()` will simply return `None` shortly
     /// after -- indistinguishable from any other early close.
     pub async fn open_stream(&self, target: &str) -> Result<(StreamSender, StreamReceiver)> {
+        let open_tx = match &*self.state_rx.borrow() {
+            ConnState::Connected(tx) => tx.clone(),
+            ConnState::Connecting => {
+                return Err(anyhow!("tunnel is reconnecting, try again shortly"));
+            }
+        };
+
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.open_tx
+        open_tx
             .send(OpenRequest { target: target.to_owned(), reply: reply_tx })
             .await
-            .map_err(|_| anyhow!("tunnel actor is gone"))?;
-        reply_rx.await.map_err(|_| anyhow!("tunnel actor is gone"))?
+            .map_err(|_| anyhow!("tunnel connection was lost, reconnecting"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("tunnel connection was lost, reconnecting"))?
     }
+}
+
+/// Owns the reconnect loop for the whole process lifetime: connect, run
+/// until that connection dies, reconnect with backoff, repeat. `state_tx`
+/// is how `open_stream` callers find out whether there's currently a
+/// connection to send requests to.
+async fn supervise(config: ClientConfig, state_tx: watch::Sender<ConnState>) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match connect_and_handshake(&config).await {
+            Ok((sender, receiver, join, crypto)) => {
+                backoff = Duration::from_secs(1);
+                let (open_tx, open_rx) = mpsc::channel(QUEUE_CAPACITY);
+                state_tx.send_replace(ConnState::Connected(open_tx));
+
+                run(sender, receiver, join, crypto, config.key_secret.clone(), open_rx).await;
+
+                eprintln!("[tunnel] connection lost, reconnecting...");
+                state_tx.send_replace(ConnState::Connecting);
+            }
+            Err(e) => {
+                eprintln!("[tunnel] failed to connect: {e:#}; retrying in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+/// One connection attempt: the Minecraft session (handshake through Play)
+/// followed by this tunnel's own authenticated key-exchange handshake over
+/// it. Returns the pieces `run` needs to own the connection.
+async fn connect_and_handshake(
+    config: &ClientConfig,
+) -> Result<(FrameSender, FrameReceiver, JoinHandle<()>, SessionCrypto)> {
+    let session = Session::connect(config).await?;
+    println!(
+        "[tunnel] minecraft transport established: uuid={} username={} entity_id={}",
+        session.uuid, session.username, session.entity_id
+    );
+
+    let Tunnel { sender, mut receiver, join } = session.spawn();
+    let crypto = perform_handshake(&sender, &mut receiver, &config.key_id, &config.key_secret).await?;
+    println!("[tunnel] handshake complete");
+
+    Ok((sender, receiver, join, crypto))
 }
 
 /// Runs the client side of the handshake described in `crypto::cipher`'s

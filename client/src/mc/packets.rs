@@ -10,7 +10,11 @@ pub use valence_protocol::packets::login::{
     LoginCompressionS2c, LoginDisconnectS2c, LoginHelloC2s, LoginHelloS2c, LoginQueryRequestS2c,
     LoginQueryResponseC2s, LoginSuccessS2c,
 };
+pub use valence_protocol::packets::play::client_command_c2s::ClientCommand;
+pub use valence_protocol::packets::play::client_settings_c2s::{ChatMode, DisplayedSkinParts, MainArm};
 pub use valence_protocol::packets::play::{
-    CustomPayloadC2s, CustomPayloadS2c, DisconnectS2c, GameJoinS2c, KeepAliveC2s, KeepAliveS2c,
+    ClientCommandC2s, ClientSettingsC2s, CustomPayloadC2s, CustomPayloadS2c, DisconnectS2c,
+    GameJoinS2c, HandSwingC2s, KeepAliveC2s, KeepAliveS2c, LookAndOnGroundC2s,
+    PlayerPositionLookS2c, TeleportConfirmC2s,
 };
-pub use valence_protocol::{Ident, Packet, PROTOCOL_VERSION, RawBytes};
+pub use valence_protocol::{Hand, Ident, Packet, PROTOCOL_VERSION, RawBytes, VarInt};

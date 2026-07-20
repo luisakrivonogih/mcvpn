@@ -10,6 +10,8 @@ mcvpn is **not** a TUN/TAP VPN. It doesn't touch routing tables, doesn't need ro
 - HTTP CONNECT **and** SOCKS5 front ends, so it carries any TCP traffic, not just HTTP(S)
 - Multiplexed streams over a single Minecraft connection, with per-stream flow control
 - Wire traffic is a real Minecraft 1.20.1 handshake/login/play session, not a lookalike protocol
+- Idle camouflage traffic (client settings, teleport acks, jittered look/swing/sneak) so the session doesn't sit silent between real requests
+- Auto-reconnect with exponential backoff for the life of the process, not just on startup
 - Forward-secret handshake (X25519 + HKDF-SHA256) and ChaCha20-Poly1305 per-frame encryption, with periodic session-key rotation
 - Per-user credentials (not one shared passphrase), on a pluggable store: memory, Postgres, MariaDB, or MongoDB
 - Web admin panel: manage users/credentials, live online status, one-click client config download
@@ -63,7 +65,7 @@ Four pieces, one repo:
 
 Drives the actual Minecraft session and exposes local HTTP CONNECT + SOCKS5 proxies:
 
-- `mc/` — Handshake → Login → (no-op Configuration stub, since protocol 763/1.20.1 predates that state) → Play, then registers the tunnel's plugin channel like a real modded client would (`mc/session.rs`, `mc/play.rs`).
+- `mc/` — Handshake → Login → (no-op Configuration stub, since protocol 763/1.20.1 predates that state) → Play, then registers the tunnel's plugin channel like a real modded client would (`mc/session.rs`, `mc/play.rs`). Once in Play, it also keeps sending the small amount of traffic a real client sends even when the player is doing nothing — client settings, teleport acks, jittered idle look/swing/sneak (`mc/camouflage.rs`) — and reconnects with exponential backoff for the life of the process if the connection ever drops.
 - `net/` — pure wire framing: a `tokio_util` `Decoder`/`Encoder` wrapping `valence_protocol`'s packet (de)serialization, compression-aware, with zero game-state knowledge (`net/codec.rs`).
 - `crypto/cipher.rs` — the security core (see [Security design](#security-design) below).
 - `tunnel/` — the multiplexer: frames streams over the one Minecraft connection with per-stream flow control and jittered session-key rotation.
@@ -143,6 +145,8 @@ A connection that never completes the handshake — wrong key, no key, or just a
 
 A connection that *does* authenticate gets hidden the instant the handshake completes — switched to spectator mode and removed from every other online player's tab list and view distance (and vice versa — real players don't see it either), whether or not it's already sent any real traffic yet. Authenticating at all is proof enough it's not a real player; it never gets a chance to sit visible in anyone's tab list first.
 
+Because this transport is offline-mode and thus fully unencrypted at the Minecraft protocol layer, an authenticated connection's own packet stream is itself something an observer could fingerprint — a session that only ever sends keep-alives and tunnel-channel payloads, and nothing else a real client sends, is a tell of its own. So once in Play the client also behaves like a real client sitting idle: it sends `ClientSettings` on join and acks the server's spawn teleport with `TeleportConfirm` (both things every real client does immediately, whose total absence would be conspicuous), plus a jittered idle tick every 2–6 seconds — look/pitch wobble, occasional arm swings, rare sneak toggles. Deliberately no chat and no simulated walking: this client has no terrain data, so faking position risks tripping vanilla's own speed/distance checks; and since authenticated connections are already hidden from every real player (see below), the only audience for this traffic is network/protocol-level, which look/swing/sneak already satisfy without that risk.
+
 This also covers the unauthenticated `ServerListPing` (the MOTD/player-sample query any Minecraft client sends before joining, no connection required) — active tunnel connections are stripped out of both the player-count and the name sample, so an outside observer who just pings the server sees a normal-looking player count and name sample, with no tunnel account in it.
 
 `/list` is overridden the same way (Bukkit lets a plugin's `plugin.yml` command take over a vanilla command by name) to exclude active tunnel connections too — identically whether it's run by a player or from console, since there's no separate "real" answer being hidden from one but not the other.
@@ -151,9 +155,9 @@ This also covers the unauthenticated `ServerListPing` (the MOTD/player-sample qu
 
 ## Status
 
-Working end-to-end against a real local Paper 1.20.1 (offline-mode) server: connect, authenticated handshake, multiplexed streams over both HTTP CONNECT and SOCKS5, per-user credentials via all four store backends (the three real-database ones verified against live Postgres/MariaDB/MongoDB instances, not just read), admin API + panel including password change and live status. Not yet done:
+Working end-to-end against a real local Paper 1.20.1 (offline-mode) server: connect, authenticated handshake, multiplexed streams over both HTTP CONNECT and SOCKS5, per-user credentials via all four store backends (the three real-database ones verified against live Postgres/MariaDB/MongoDB instances, not just read), admin API + panel including password change and live status, idle camouflage traffic, and auto-reconnect with backoff (verified via a forced kill and a console `/kick`, including relaying real traffic again post-reconnect). Not yet done:
 
-- No live reconnect — if the underlying Minecraft connection drops, open streams die and the client needs a restart.
+- Reconnecting can't resume streams that were open on the old connection — they end, and the local proxied sockets close with them, same as any other close.
 - Client only targets protocol 763 (Minecraft 1.20.1); `valence_protocol` 0.2.0-alpha.1 doesn't yet support the Configuration state newer versions require, so bumping past 1.20.1 is blocked upstream, not by design here.
 - Client only supports offline-mode servers (see above).
 

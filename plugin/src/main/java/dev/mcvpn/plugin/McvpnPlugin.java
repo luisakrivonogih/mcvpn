@@ -82,6 +82,15 @@ public final class McvpnPlugin extends JavaPlugin implements PluginMessageListen
         getServer().getMessenger().registerOutgoingPluginChannel(this, channel);
         getServer().getPluginManager().registerEvents(this, this);
 
+        // PluginCommand.execute() checks the command's plugin.yml permission
+        // -- mcvpn.console, default: false -- before onCommand() ever runs.
+        // Console counts as "op" for permission purposes, but a default:
+        // false permission returns false unconditionally regardless of op
+        // status, so without this attachment the console itself gets
+        // rejected at the permission check and never reaches McvpnCommand's
+        // own console-only enforcement below.
+        getServer().getConsoleSender().addAttachment(this, "mcvpn.console", true);
+
         McvpnCommand commandExecutor = new McvpnCommand(this, userStore);
         var mcvpnCommand = getCommand("mcvpn");
         if (mcvpnCommand != null) {

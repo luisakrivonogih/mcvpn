@@ -1,3 +1,4 @@
+pub mod camouflage;
 pub mod configuration;
 pub mod handshake;
 pub mod login;
