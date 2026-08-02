@@ -2,12 +2,13 @@
 
 An application-level encrypted TCP tunnel carried over a real Minecraft protocol session.
 
-mcvpn is **not** a TUN/TAP VPN. It doesn't touch routing tables, doesn't need root/admin, and doesn't create a virtual network interface. It's a multiplexed, encrypted tunnel that happens to move its bytes by actually speaking the Minecraft protocol — a real Handshake, a real (offline-mode) Login, a real Play state, a real plugin channel — against a real Paper server. It's designed so that, to anything watching the network, it looks like someone playing Minecraft, because it *is* a real Minecraft session underneath.
+At its core, mcvpn is **not** a TUN/TAP VPN. The tunnel itself doesn't touch routing tables, doesn't need root/admin, and doesn't create a virtual network interface — it's a multiplexed, encrypted tunnel that happens to move its bytes by actually speaking the Minecraft protocol — a real Handshake, a real (offline-mode) Login, a real Play state, a real plugin channel — against a real Paper server. It's designed so that, to anything watching the network, it looks like someone playing Minecraft, because it *is* a real Minecraft session underneath. The GUI app (below) adds an optional whole-device TUN mode on top of that same tunnel, for platforms/users that want every app's traffic covered instead of configuring each app's proxy setting individually.
 
 ## Features
 
-- No TUN/TAP, no root/admin required — it's a userspace proxy, not a virtual network interface
+- No TUN/TAP, no root/admin required for the core tunnel — it's a userspace proxy, not a virtual network interface
 - HTTP CONNECT **and** SOCKS5 front ends, so it carries any TCP traffic, not just HTTP(S)
+- SOCKS5 UDP ASSOCIATE support, so the tunnel also carries UDP (DNS, QUIC, games), not just TCP
 - Multiplexed streams over a single Minecraft connection, with per-stream flow control
 - Wire traffic is a real Minecraft 1.20.1 handshake/login/play session, not a lookalike protocol
 - Idle camouflage traffic (client settings, teleport acks, jittered look/swing/sneak) so the session doesn't sit silent between real requests
@@ -15,6 +16,7 @@ mcvpn is **not** a TUN/TAP VPN. It doesn't touch routing tables, doesn't need ro
 - Forward-secret handshake (X25519 + HKDF-SHA256) and ChaCha20-Poly1305 per-frame encryption, with periodic session-key rotation
 - Per-user credentials (not one shared passphrase), on a pluggable store: memory, Postgres, MariaDB, or MongoDB
 - Web admin panel: manage users/credentials, live online status, one-click client config download
+- Cross-platform GUI app (Android, iOS, macOS, Windows, Linux), with an optional whole-device TUN mode on Android/Windows/Linux alongside the scriptable Rust CLI
 
 ```
     app
@@ -23,7 +25,7 @@ mcvpn is **not** a TUN/TAP VPN. It doesn't touch routing tables, doesn't need ro
 HTTP CONNECT / SOCKS5  (proxy_listen / socks_listen)
      │
      ▼
-  mcvpn client (Rust)
+  mcvpn client (Rust, or the app's built-in Dart client)
      │
      ▼
 Minecraft protocol, port 25565
@@ -32,8 +34,10 @@ Minecraft protocol, port 25565
 Paper server + mcvpn plugin
      │
      ▼
-  target TCP service
+  target TCP/UDP service
 ```
+
+In whole-device mode, the app puts its own TUN interface (via `tun-engine` on Windows/Linux, `VpnService` + JNI `tun2socks` on Android) in front of that same HTTP CONNECT/SOCKS5 step, so every app's traffic is captured, not just apps configured to use the proxy.
 
 ## Why
 
@@ -52,12 +56,14 @@ Plain VPN protocols aren't trying to disguise *what* they are — they're built 
 
 ## How it's built
 
-Four pieces, one repo:
+Six pieces, one repo:
 
 | Directory | What | Stack |
 |---|---|---|
 | [`client/`](client/) | The tunnel client: HTTP CONNECT + SOCKS5 proxies in front, real Minecraft client behind | Rust, Tokio, `valence_protocol` |
-| [`plugin/`](plugin/) | Server-side Paper plugin: authenticates, decrypts, demultiplexes to real TCP targets | Java 17+, Paper API 1.20.1 |
+| [`app/`](app/) | Cross-platform GUI client: same tunnel protocol, plus proxy-mode and whole-device TUN mode, server profile management, live stats | Flutter/Dart |
+| [`tun-engine/`](tun-engine/) | Whole-device TUN helper the app drives on Windows/Linux (and, as a JNI build, Android) | Go, wraps `tun2socks` |
+| [`plugin/`](plugin/) | Server-side Paper plugin: authenticates, decrypts, demultiplexes to real TCP/UDP targets | Java 17+, Paper API 1.20.1 |
 | [`panel/`](panel/) | Admin web UI for managing users/credentials against the plugin's HTTP API | SvelteKit 2, Svelte 5, TypeScript |
 | `server/` | *(gitignored, not shipped)* a local Paper server used for manual end-to-end testing during development | — |
 
@@ -84,11 +90,42 @@ cargo run --release -- config.toml
 
 Point any HTTP(S)-proxy-aware application at `proxy_listen` (default `127.0.0.1:8080`), or anything that speaks SOCKS5 at `socks_listen` (default `127.0.0.1:1080`) — use whichever matches what the app you're tunneling actually supports.
 
+### App (`app/`)
+
+The GUI client: a Dart reimplementation of the same handshake/multiplexer/proxy stack as `client/` (`lib/src/core`, `lib/src/crypto`, `lib/src/tunnel`, `lib/src/proxy`), so it doesn't shell out to the Rust binary — plus server-profile management, live connection stats, and two connection modes selectable per profile:
+
+- **Proxy mode** — runs the local HTTP CONNECT/SOCKS5 proxies, same as `client/`; other apps still need to be pointed at them individually.
+- **Full tunnel (whole-device TUN) mode** — captures all of the device's traffic and routes it through the tunnel automatically, no per-app configuration:
+  - **Android**: `McVpnService.kt` (`VpnService`) hands captured packets to a `tun2socks` engine loaded as a JNI `.so` (`Tun2Socks.kt`), built from `tun-engine/android`.
+  - **Windows/Linux**: `lib/src/vpn/desktop_tun.dart` spawns `tun-engine` as an elevated child process (UAC on Windows, `pkexec` on Linux) and talks to it over a status/stop file pair, since an elevated child on Windows loses inherited stdio.
+  - **iOS/macOS**: not implemented — needs a `NetworkExtension` system extension, which needs a paid Apple Developer Program account. Those two platforms get proxy mode only for now; `lib/src/vpn/system_proxy.dart` covers the common case there (and is also offered on Windows/Linux as a lighter-weight alternative to full tunnel mode) by pointing the OS's system-wide proxy settings at the app's local proxies.
+
+**Run it:**
+
+```sh
+cd app
+flutter pub get
+flutter run
+```
+
+Building distributable packages (desktop installers, the Android APK, with `tun-engine`/JNI libs bundled) goes through `scripts/build.sh` — see `--help` output (or just run it with no arguments for an interactive menu) — or via CI (below) for platforms that can't be cross-compiled locally.
+
+### tun-engine (`tun-engine/`)
+
+The whole-device TUN helper `app/` drives on Windows and Linux desktop (see [`tun-engine/README.md`](tun-engine/README.md) for the full picture). Wraps [xjasonlyu/tun2socks](https://github.com/xjasonlyu/tun2socks) (gVisor netstack, no reimplemented TCP/IP) to turn a TUN interface into a client of the app's local SOCKS5 proxy, and drives OS routing so the whole device goes through the tunnel except the Minecraft connection carrying it. Pure Go, no cgo, so it cross-compiles for every desktop target from any host. The Android build of the same tun2socks core is compiled separately, as a `gomobile bind` JNI library (`tun-engine/android`), rather than spawned as a subprocess.
+
+**This has only been cross-compiled and `go vet`-checked, not run on real Windows/Linux hardware yet** — see the caveat in `tun-engine/README.md` before relying on it.
+
+### CI (`.github/workflows/release.yml`)
+
+Builds every packaged artifact on a tag push (`v*`) or manual dispatch: macOS `.dmg` (universal), Windows `.exe`/`.msi`, Linux `.deb`/`.rpm`, Android `.apk` — across a runner matrix, because Flutter refuses to cross-compile desktop targets (confirmed, not assumed: `flutter build windows`/`flutter build linux` both refuse outright on a non-matching host). `tun-engine` is built once on Linux and handed to both the Windows and Linux jobs.
+
 ### Plugin (`plugin/`)
 
 Drop the built jar into your Paper 1.20.1 server's `plugins/` folder. On first boot it:
 
 - Registers the tunnel's plugin channel (`channel:` in `config.yml`, default `mcvpn:tunnel`).
+- Demultiplexes both TCP streams and UDP associations per player (`PlayerMultiplex`, `StreamState`/`UdpAssociationState`): an `OPEN_UDP` frame opens an association with one shared `DatagramSocket`, and each `DATAGRAM` frame carries its own destination `host:port`, mirroring how SOCKS5's UDP ASSOCIATE lets one relay port talk to many destinations — this is what lets the app's whole-device TUN mode carry UDP (DNS, QUIC, games), not just TCP.
 - Bootstraps a default `admin`/`admin` account if no admin exists yet, and keeps warning loudly on every restart until that account is renamed or deleted.
 - Starts an admin HTTP API (default `127.0.0.1:8081`) for the panel, and registers `/mcvpn` for **console-only** use without needing the panel at all — no player, not even an op, can see or run it (it's invisible in tab-completion and `/help`, and the command rejects any non-console sender outright, mimicking vanilla's "unknown command" instead of a permission-denied message that would itself reveal it exists):
 
@@ -160,6 +197,9 @@ Working end-to-end against a real local Paper 1.20.1 (offline-mode) server: conn
 - Reconnecting can't resume streams that were open on the old connection — they end, and the local proxied sockets close with them, same as any other close.
 - Client only targets protocol 763 (Minecraft 1.20.1); `valence_protocol` 0.2.0-alpha.1 doesn't yet support the Configuration state newer versions require, so bumping past 1.20.1 is blocked upstream, not by design here.
 - Client only supports offline-mode servers (see above).
+- UDP ASSOCIATE (plugin `UdpAssociationState`, app/`tun-engine` full-tunnel mode) is new and hasn't had the same real-server soak testing as the TCP path yet.
+- `tun-engine` has only been cross-compiled and `go vet`-checked from a macOS dev machine — not run on real Windows or Linux hardware. Treat first runs there as a test, not a formality; OS routing-table manipulation is the part most likely to need per-distro/per-Windows-version adjustment.
+- Full-tunnel (TUN) mode isn't implemented on iOS/macOS — blocked on a paid Apple Developer Program account for the required `NetworkExtension` entitlement. Those two platforms get proxy mode / system-proxy mode only.
 
 ## Disclaimer
 

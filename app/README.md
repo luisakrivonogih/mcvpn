@@ -15,11 +15,22 @@ streams over one connection. No native tunnel code required for the core.
 | Mode | What it does | Platforms |
 |---|---|---|
 | **Proxy** | Runs a local **HTTP CONNECT** proxy and a **SOCKS5** proxy. Point any app (or your system proxy) at them; all that TCP traffic rides the tunnel. | Everywhere (Android, iOS, macOS, Windows, Linux) |
-| **Full tunnel (TUN)** | Captures **all** device traffic via the OS VPN service and routes it through the tunnel — like an ordinary VPN app. | Android (wired); other platforms via a native extension — see below |
+| **Full tunnel (TUN)** | Captures **all** device traffic via a TUN interface and routes it through the tunnel — like an ordinary VPN app. | Android, Windows, Linux. Not on iOS/macOS — needs a `NetworkExtension` entitlement, which needs a paid Apple Developer Program account. |
 
-Full-tunnel mode reuses the same Dart tunnel: the OS TUN feeds a tun2socks
-engine that forwards to the app's own local SOCKS5 proxy. See
-[`android/INTEGRATION.md`](android/INTEGRATION.md).
+Full-tunnel mode reuses the same Dart tunnel: a TUN interface feeds a
+tun2socks engine that forwards to the app's own local SOCKS5 proxy.
+- Android: `VpnService` + the tun2socks core built as a JNI library — see
+  [`android/INTEGRATION.md`](android/INTEGRATION.md).
+- Windows/Linux: `lib/src/vpn/desktop_tun.dart` spawns
+  [`../tun-engine`](../tun-engine) (same tun2socks core, as a standalone
+  binary) elevated, since creating a TUN device and editing routes needs
+  admin/root.
+
+On iOS/macOS, or on Windows/Linux if you'd rather not elevate anything,
+`lib/src/vpn/system_proxy.dart` offers a lighter-weight alternative: it
+points the OS's system-wide proxy settings at Proxy mode's local proxies,
+covering most apps (browsers included) without a TUN interface or
+elevated privileges — see the **System proxy** note in Settings.
 
 ## Getting a credential
 
@@ -58,7 +69,11 @@ flutter run -d linux
 > Android Kotlin files — it only fills in the missing native scaffolding.
 
 For TUN mode on Android, also do the manifest + tun2socks steps in
-[`android/INTEGRATION.md`](android/INTEGRATION.md).
+[`android/INTEGRATION.md`](android/INTEGRATION.md). For TUN mode on
+Windows/Linux, the `tun-engine` binary needs to sit next to the app's own
+executable — `scripts/build.sh` (one level up) handles that as part of
+packaging a build; running `flutter run` straight from source will not
+have it there.
 
 ### Using proxy mode
 
@@ -91,9 +106,11 @@ lib/src/
   ui/       responsive Material 3 app (home · servers · logs · settings)
 ```
 
-The protocol is a byte-for-byte match with the reference implementations in the
-`mcvpn` repo (`client/` in Rust, `plugin/` in Java) — same packet IDs, same
-handshake transcript, same AEAD envelope and HKDF labels.
+The protocol is a byte-for-byte match with the reference implementations in
+this repo (`../client/` in Rust, `../plugin/` in Java) — same packet IDs, same
+handshake transcript, same AEAD envelope and HKDF labels. Also carries the
+plugin's SOCKS5 UDP ASSOCIATE support (`OPEN_UDP`/`DATAGRAM` frames), which
+is what lets full-tunnel mode forward UDP (DNS, QUIC, games) and not just TCP.
 
 ## Notes & limitations
 
@@ -103,5 +120,7 @@ handshake transcript, same AEAD envelope and HKDF labels.
   end and their local sockets close, same as the reference client.
 - Web is not a target for the tunnel (browsers can't open raw TCP); the UI is
   otherwise platform-agnostic.
-- Full-tunnel mode needs a tun2socks engine dropped in per platform; Proxy mode
-  works everywhere with no native code.
+- Full-tunnel mode is wired up for Android, Windows, and Linux (see above);
+  iOS/macOS get Proxy mode and System proxy mode only. `tun-engine` itself has
+  only been cross-compiled and `go vet`-checked, not run on real Windows/Linux
+  hardware yet — see [`../tun-engine/README.md`](../tun-engine/README.md).
