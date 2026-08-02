@@ -1,0 +1,30 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock
+
+# Platform folders are tracked (macos/ carries hand-edited entitlements,
+# and CI needs windows/linux/macos checked out to build them at all --
+# Flutter doesn't regenerate desktop scaffolding on a different host OS).
+# Keep the hand-written Android VPN integration, ignore generated bits:
+/android/.gradle/
+/android/local.properties
+/android/app/build/
+/android/build/
+/android/.idea/
+/android/gradle/
+/android/gradlew
+/android/gradlew.bat
+/android/gradle.properties
+/android/settings.gradle
+/android/build.gradle
+# Built from mcvpn/tun-engine/android by scripts/build.sh / CI, not committed:
+/android/app/src/main/jniLibs/
+
+# IDE
+.idea/
+*.iml
+.vscode/

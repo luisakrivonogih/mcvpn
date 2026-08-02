@@ -1,0 +1,28 @@
+name: mcvpn
+description: A stylish cross-platform client for the mcvpn tunnel (VPN over a real Minecraft session).
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # AEAD (ChaCha20-Poly1305), X25519, HKDF, HMAC-SHA256 — the tunnel's crypto core.
+  cryptography: ^2.7.0
+  # Lightweight state management for the UI.
+  provider: ^6.1.2
+  # Persist server profiles + settings.
+  shared_preferences: ^2.2.3
+  # Nice iconography that matches the design language on every platform.
+  cupertino_icons: ^1.0.6
+
+dev_dependencies:
+  flutter_lints: ^4.0.0
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

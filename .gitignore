@@ -1,6 +1,10 @@
 /client/target
 /server
 
+# Local build outputs (scripts/build.sh, tun-engine cross-builds)
+/dist/
+/tun-engine/dist/
+/tun-engine/android/dist/
 
 node_modules
 
