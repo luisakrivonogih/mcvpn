@@ -2,6 +2,7 @@ package dev.mcvpn.plugin;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 /**
  * The multiplexed frame format carried inside each encrypted envelope (see
@@ -28,7 +29,9 @@ final class Frame {
         PING(4),
         PONG(5),
         WINDOW_UPDATE(6),
-        KEY_UPDATE(7);
+        KEY_UPDATE(7),
+        OPEN_UDP(8),
+        DATAGRAM(9);
 
         final byte wireValue;
 
@@ -98,6 +101,43 @@ final class Frame {
 
     static Frame keyUpdate(byte[] ephemeralPublicKey) {
         return new Frame(CONTROL_STREAM, Type.KEY_UPDATE, ephemeralPublicKey);
+    }
+
+    /** Opens a UDP association -- see the Dart client's `Frame.openUdp` doc for why there's no fixed target. */
+    static Frame openUdp(int streamId) {
+        return new Frame(streamId, Type.OPEN_UDP, new byte[0]);
+    }
+
+    /**
+     * One whole UDP datagram to/from {@code host:port}, never chunked. Wire
+     * format: {@code host_len:u8 || host_utf8 || port:u16 BE || data} --
+     * must match the Dart client's {@code Frame.datagram} byte-for-byte.
+     */
+    static Frame datagram(int streamId, String host, int port, byte[] data) {
+        byte[] hostBytes = host.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buf = ByteBuffer.allocate(1 + hostBytes.length + 2 + data.length);
+        buf.put((byte) hostBytes.length);
+        buf.put(hostBytes);
+        buf.putShort((short) port);
+        buf.put(data);
+        return new Frame(streamId, Type.DATAGRAM, buf.array());
+    }
+
+    record DatagramPayload(String host, int port, byte[] data) {}
+
+    /** Decodes this frame's payload as a [DatagramPayload], or null if malformed. */
+    DatagramPayload decodeDatagram() {
+        if (payload.length < 1) {
+            return null;
+        }
+        int hostLen = payload[0] & 0xff;
+        if (payload.length < 1 + hostLen + 2) {
+            return null;
+        }
+        String host = new String(payload, 1, hostLen, StandardCharsets.UTF_8);
+        int port = ((payload[1 + hostLen] & 0xff) << 8) | (payload[1 + hostLen + 1] & 0xff);
+        byte[] data = Arrays.copyOfRange(payload, 1 + hostLen + 2, payload.length);
+        return new DatagramPayload(host, port, data);
     }
 
     String openTarget() {

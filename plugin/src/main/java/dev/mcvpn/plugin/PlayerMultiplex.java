@@ -38,6 +38,7 @@ final class PlayerMultiplex {
 
     private final AtomicReference<TunnelCrypto> crypto = new AtomicReference<>();
     private final Map<Integer, StreamState> streams = new ConcurrentHashMap<>();
+    private final Map<Integer, UdpAssociationState> udpAssociations = new ConcurrentHashMap<>();
     private final AtomicBoolean stealthApplied = new AtomicBoolean(false);
 
     // Resolved once handshake message 1 authenticates successfully; needed
@@ -199,6 +200,23 @@ final class PlayerMultiplex {
                 if (stream != null) {
                     stream.close();
                 }
+                UdpAssociationState udp = udpAssociations.remove(frame.streamId);
+                if (udp != null) {
+                    udp.close();
+                }
+            }
+            case OPEN_UDP -> {
+                UdpAssociationState udp = new UdpAssociationState(this, frame.streamId);
+                udpAssociations.put(frame.streamId, udp);
+            }
+            case DATAGRAM -> {
+                UdpAssociationState udp = udpAssociations.get(frame.streamId);
+                if (udp != null) {
+                    Frame.DatagramPayload d = frame.decodeDatagram();
+                    if (d != null) {
+                        udp.handleDatagram(d.host(), d.port(), d.data());
+                    }
+                }
             }
             case PING -> sendFrame(new Frame(Frame.CONTROL_STREAM, Frame.Type.PONG, frame.payload));
             case PONG -> {
@@ -246,6 +264,10 @@ final class PlayerMultiplex {
         streams.remove(streamId);
     }
 
+    void removeUdpAssociation(int streamId) {
+        udpAssociations.remove(streamId);
+    }
+
     /** Encrypts and sends one frame back to the player. Returns false if that failed. */
     boolean sendFrame(Frame frame) {
         TunnelCrypto tc = crypto.get();
@@ -290,5 +312,7 @@ final class PlayerMultiplex {
     void close() {
         streams.values().forEach(StreamState::close);
         streams.clear();
+        udpAssociations.values().forEach(UdpAssociationState::close);
+        udpAssociations.clear();
     }
 }
