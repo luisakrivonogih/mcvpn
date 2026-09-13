@@ -14,6 +14,7 @@ public final class MariaUserStore extends AbstractJdbcUserStore {
 
     private static HikariConfig buildConfig(String host, int port, String database, String user, String password) {
         HikariConfig config = new HikariConfig();
+        config.setDriverClassName("org.mariadb.jdbc.Driver");
         config.setJdbcUrl("jdbc:mariadb://" + host + ":" + port + "/" + database);
         config.setUsername(user);
         config.setPassword(password);

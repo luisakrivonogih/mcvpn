@@ -21,6 +21,11 @@ class BufferedSocket {
 
   BufferedSocket(this.socket) {
     socket.setOption(SocketOption.tcpNoDelay, true);
+    // Read-side failures are delivered to the subscription below, while
+    // write-side failures complete IOSink.done with an error. Observe both:
+    // otherwise a normal peer reset can escape as an unhandled zone error
+    // after the relay has already shut down successfully.
+    unawaited(socket.done.catchError((Object _) {}));
     _sub = socket.listen(
       _onData,
       onDone: () {

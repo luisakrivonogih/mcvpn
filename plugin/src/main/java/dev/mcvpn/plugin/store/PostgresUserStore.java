@@ -14,6 +14,9 @@ public final class PostgresUserStore extends AbstractJdbcUserStore {
 
     private static HikariConfig buildConfig(String host, int port, String database, String user, String password) {
         HikariConfig config = new HikariConfig();
+        // Paper isolates plugins in separate class loaders, so DriverManager
+        // service discovery can miss an otherwise correctly shaded driver.
+        config.setDriverClassName("org.postgresql.Driver");
         config.setJdbcUrl("jdbc:postgresql://" + host + ":" + port + "/" + database);
         config.setUsername(user);
         config.setPassword(password);

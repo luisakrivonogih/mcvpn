@@ -35,8 +35,9 @@ class Socks5Proxy {
   }
 
   Future<void> _handle(Socket socket) async {
-    final bs = BufferedSocket(socket);
+    late final BufferedSocket bs;
     try {
+      bs = BufferedSocket(socket);
       final ver = await bs.readByte();
       if (ver != 0x05) {
         bs.destroy();
@@ -106,7 +107,11 @@ class Socks5Proxy {
       await bs.relayTo(stream);
     } catch (e) {
       log('[socks5] session error: $e');
-      bs.destroy();
+      try {
+        bs.destroy();
+      } catch (_) {
+        socket.destroy();
+      }
     }
   }
 
