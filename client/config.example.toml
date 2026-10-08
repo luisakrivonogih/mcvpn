@@ -40,3 +40,12 @@ socks_listen = "127.0.0.1:1080"
 # tunnel allowance and impersonate this client on the handshake.
 key_id = "00112233445566778899aabbccddeeff"
 key_secret = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+
+# Optional static UDP forwards through the tunnel. Each datagram sent to
+# `listen` is delivered to `target` from the server side, and replies come
+# back to the local sender -- e.g. a WireGuard peer whose Endpoint is
+# `listen`, so the WireGuard interface carries any IP traffic over mcvpn.
+#
+# [[udp_forward]]
+# listen = "127.0.0.1:51001"
+# target = "203.0.113.5:53000"

@@ -32,6 +32,16 @@ pub struct ClientConfig {
     /// use it as an anonymous open TCP relay. Must match the secret the
     /// admin panel issued alongside `key_id`.
     pub key_secret: Vec<u8>,
+    /// Static UDP forwards through the tunnel (see `proxy::udp_forward`).
+    pub udp_forward: Vec<UdpForward>,
+}
+
+/// One `[[udp_forward]]` entry: datagrams to the local `listen` address go
+/// to `target` (`"host:port"`) on the far side of the tunnel.
+#[derive(Clone, Deserialize)]
+pub struct UdpForward {
+    pub listen: String,
+    pub target: String,
 }
 
 /// Raw TOML shape. Non-credential fields fall back to the same local-testing
@@ -50,6 +60,8 @@ struct RawConfig {
     socks_listen: String,
     key_id: Option<String>,
     key_secret: Option<String>,
+    #[serde(default)]
+    udp_forward: Vec<UdpForward>,
 }
 
 fn default_server_host() -> String {
@@ -94,6 +106,7 @@ impl ClientConfig {
                 .try_into()
                 .expect("length checked above"),
             key_secret: required_hex_field("key_secret", raw.key_secret, 32),
+            udp_forward: raw.udp_forward,
         }
     }
 }

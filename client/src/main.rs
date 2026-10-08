@@ -30,9 +30,16 @@ async fn main() -> anyhow::Result<()> {
     // listener failing to even bind is fatal; a single connection failing
     // inside either is handled per-connection and never brings the process
     // down.
+    let forwards = futures::future::try_join_all(
+        config
+            .udp_forward
+            .iter()
+            .map(|f| proxy::udp_forward::serve(&f.listen, &f.target, Arc::clone(&multiplexer))),
+    );
     tokio::try_join!(
         proxy::http::serve(&config.proxy_listen, Arc::clone(&multiplexer)),
-        proxy::socks5::serve(&config.socks_listen, multiplexer),
+        proxy::socks5::serve(&config.socks_listen, Arc::clone(&multiplexer)),
+        forwards,
     )?;
     Ok(())
 }

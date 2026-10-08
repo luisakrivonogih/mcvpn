@@ -28,6 +28,12 @@ use crate::mc::session::{FrameReceiver, FrameSender, Session, Tunnel};
 
 use super::frame::{CONTROL_STREAM, Frame, FrameType};
 use super::stream::{StreamReceiver, StreamSender, StreamShared};
+use super::udp::{Datagram, UdpReceiver, UdpSender};
+
+/// Datagrams buffered per association before newer ones are dropped --
+/// UDP's own semantics, and it keeps one slow consumer from stalling the
+/// connection's receive loop.
+const UDP_QUEUE_CAPACITY: usize = 256;
 
 /// Wire-sized chunk cap: `mc::session::MAX_FRAME_LEN` (32000) minus the
 /// frame header (10 bytes) and the AEAD envelope overhead (8-byte counter
@@ -71,13 +77,17 @@ enum ConnState {
     Connected(mpsc::Sender<OpenRequest>),
 }
 
+enum OpenKind {
+    Stream { target: String, reply: oneshot::Sender<Result<(StreamSender, StreamReceiver)>> },
+    Udp { reply: oneshot::Sender<Result<(UdpSender, UdpReceiver)>> },
+}
+
 pub struct Multiplexer {
     state_rx: watch::Receiver<ConnState>,
 }
 
 struct OpenRequest {
-    target: String,
-    reply: oneshot::Sender<Result<(StreamSender, StreamReceiver)>>,
+    kind: OpenKind,
 }
 
 struct StreamEntry {
@@ -123,21 +133,35 @@ impl Multiplexer {
     /// returned `StreamReceiver::recv()` will simply return `None` shortly
     /// after -- indistinguishable from any other early close.
     pub async fn open_stream(&self, target: &str) -> Result<(StreamSender, StreamReceiver)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request(OpenKind::Stream { target: target.to_owned(), reply: reply_tx }).await?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("tunnel connection was lost, reconnecting"))?
+    }
+
+    /// Opens a UDP association (the plugin's `OPEN_UDP`). Like a stream, it
+    /// ends -- `UdpReceiver::recv()` returns `None` -- if the underlying
+    /// connection is lost; callers reopen one after the reconnect.
+    pub async fn open_udp(&self) -> Result<(UdpSender, UdpReceiver)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request(OpenKind::Udp { reply: reply_tx }).await?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("tunnel connection was lost, reconnecting"))?
+    }
+
+    async fn request(&self, kind: OpenKind) -> Result<()> {
         let open_tx = match &*self.state_rx.borrow() {
             ConnState::Connected(tx) => tx.clone(),
             ConnState::Connecting => {
                 return Err(anyhow!("tunnel is reconnecting, try again shortly"));
             }
         };
-
-        let (reply_tx, reply_rx) = oneshot::channel();
         open_tx
-            .send(OpenRequest { target: target.to_owned(), reply: reply_tx })
+            .send(OpenRequest { kind })
             .await
-            .map_err(|_| anyhow!("tunnel connection was lost, reconnecting"))?;
-        reply_rx
-            .await
-            .map_err(|_| anyhow!("tunnel connection was lost, reconnecting"))?
+            .map_err(|_| anyhow!("tunnel connection was lost, reconnecting"))
     }
 }
 
@@ -251,6 +275,7 @@ async fn run(
     mut open_rx: mpsc::Receiver<OpenRequest>,
 ) {
     let mut streams: HashMap<u32, StreamEntry> = HashMap::new();
+    let mut udp: HashMap<u32, mpsc::Sender<Datagram>> = HashMap::new();
     let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(QUEUE_CAPACITY);
     let next_stream_id = AtomicU32::new(1);
 
@@ -280,24 +305,43 @@ async fn run(
                 rotation_timer.as_mut().reset(tokio::time::Instant::now() + next_rotation_delay());
             }
 
-            // A caller wants a new logical stream.
+            // A caller wants a new logical stream or UDP association.
             req = open_rx.recv() => {
                 let Some(req) = req else { break };
                 let id = next_stream_id.fetch_add(1, Ordering::Relaxed);
 
-                let send_credit = Arc::new(Semaphore::new(INITIAL_WINDOW as usize));
-                let (inbound_tx, inbound_rx) = mpsc::channel(32);
-                streams.insert(id, StreamEntry { inbound_tx, send_credit: Arc::clone(&send_credit) });
+                match req.kind {
+                    OpenKind::Stream { target, reply } => {
+                        let send_credit = Arc::new(Semaphore::new(INITIAL_WINDOW as usize));
+                        let (inbound_tx, inbound_rx) = mpsc::channel(32);
+                        streams.insert(id, StreamEntry { inbound_tx, send_credit: Arc::clone(&send_credit) });
 
-                let shared = Arc::new(StreamShared { id, send_credit, outbound: frame_tx.clone() });
-                let handles = (StreamSender { shared }, StreamReceiver { inbound: inbound_rx });
+                        let shared = Arc::new(StreamShared { id, send_credit, outbound: frame_tx.clone() });
+                        let handles = (StreamSender { shared }, StreamReceiver { inbound: inbound_rx });
 
-                let envelope = crypto.seal(&Frame::open(id, &req.target).encode());
-                if sender.send(Bytes::from(envelope)).await.is_err() {
-                    let _ = req.reply.send(Err(anyhow!("tunnel closed")));
-                    break;
+                        let envelope = crypto.seal(&Frame::open(id, &target).encode());
+                        if sender.send(Bytes::from(envelope)).await.is_err() {
+                            let _ = reply.send(Err(anyhow!("tunnel closed")));
+                            break;
+                        }
+                        let _ = reply.send(Ok(handles));
+                    }
+                    OpenKind::Udp { reply } => {
+                        let (inbound_tx, inbound_rx) = mpsc::channel(UDP_QUEUE_CAPACITY);
+                        udp.insert(id, inbound_tx);
+                        let handles = (
+                            UdpSender { id, outbound: frame_tx.clone() },
+                            UdpReceiver { inbound: inbound_rx },
+                        );
+
+                        let envelope = crypto.seal(&Frame::open_udp(id).encode());
+                        if sender.send(Bytes::from(envelope)).await.is_err() {
+                            let _ = reply.send(Err(anyhow!("tunnel closed")));
+                            break;
+                        }
+                        let _ = reply.send(Ok(handles));
+                    }
                 }
-                let _ = req.reply.send(Ok(handles));
             }
 
             // A stream wants to send a frame (data, close, or a
@@ -313,6 +357,7 @@ async fn run(
                 }
                 if is_close {
                     streams.remove(&stream_id);
+                    udp.remove(&stream_id);
                 }
             }
 
@@ -334,7 +379,7 @@ async fn run(
                     continue;
                 }
 
-                handle_incoming(incoming, &mut streams, &frame_tx).await;
+                handle_incoming(incoming, &mut streams, &mut udp, &frame_tx).await;
             }
         }
     }
@@ -380,6 +425,7 @@ async fn handle_key_update(
 async fn handle_incoming(
     frame: Frame,
     streams: &mut HashMap<u32, StreamEntry>,
+    udp: &mut HashMap<u32, mpsc::Sender<Datagram>>,
     frame_tx: &mpsc::Sender<Frame>,
 ) {
     match frame.frame_type {
@@ -410,14 +456,25 @@ async fn handle_incoming(
         }
         FrameType::Close => {
             streams.remove(&frame.stream_id);
+            udp.remove(&frame.stream_id);
+        }
+        FrameType::Datagram => {
+            let Some(inbound_tx) = udp.get(&frame.stream_id) else { return };
+            let Ok(datagram) = frame.decode_datagram() else { return };
+            match inbound_tx.try_send(datagram) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    udp.remove(&frame.stream_id);
+                }
+            }
         }
         FrameType::Ping => {
             let pong = Frame { stream_id: CONTROL_STREAM, frame_type: FrameType::Pong, payload: frame.payload };
             let _ = frame_tx.send(pong).await;
         }
-        FrameType::Pong | FrameType::Open => {
-            // We never receive Open (only the client opens streams in this
-            // design) and a Pong needs no action beyond having arrived.
+        FrameType::Pong | FrameType::Open | FrameType::OpenUdp => {
+            // We never receive Open/OpenUdp (only the client opens streams
+            // and associations) and a Pong needs no action beyond arriving.
         }
         FrameType::KeyUpdate => {
             // Unreachable in practice: `run()` intercepts and handles

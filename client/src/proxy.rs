@@ -1,5 +1,6 @@
 pub mod http;
 pub mod socks5;
+pub mod udp_forward;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

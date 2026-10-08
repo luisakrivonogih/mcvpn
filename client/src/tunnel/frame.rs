@@ -51,6 +51,15 @@ pub enum FrameType {
     /// sides then derive fresh session keys from the DH output -- see
     /// `crypto::cipher` for the full key-rollover protocol.
     KeyUpdate,
+    /// Opens a UDP association. Empty payload: unlike a stream there is no
+    /// fixed target, every `Datagram` names its own (SOCKS5 UDP ASSOCIATE
+    /// semantics). Matches the plugin's `Frame.Type.OPEN_UDP`.
+    OpenUdp,
+    /// One whole UDP datagram on an association, never chunked. Payload:
+    /// `host_len: u8 || host_utf8 || port: u16 BE || data` -- byte-for-byte
+    /// the plugin's `Frame.datagram`. Toward the plugin it names the
+    /// destination; from the plugin, the address the reply came from.
+    Datagram,
 }
 
 impl FrameType {
@@ -63,6 +72,8 @@ impl FrameType {
             FrameType::Pong => 5,
             FrameType::WindowUpdate => 6,
             FrameType::KeyUpdate => 7,
+            FrameType::OpenUdp => 8,
+            FrameType::Datagram => 9,
         }
     }
 
@@ -75,6 +86,8 @@ impl FrameType {
             5 => FrameType::Pong,
             6 => FrameType::WindowUpdate,
             7 => FrameType::KeyUpdate,
+            8 => FrameType::OpenUdp,
+            9 => FrameType::Datagram,
             other => bail!("unknown frame type {other}"),
         })
     }
@@ -143,11 +156,74 @@ impl Frame {
         }
     }
 
+    pub fn open_udp(stream_id: u32) -> Self {
+        Frame { stream_id, frame_type: FrameType::OpenUdp, payload: Bytes::new() }
+    }
+
+    pub fn datagram(stream_id: u32, host: &str, port: u16, data: &[u8]) -> Result<Self> {
+        let host = host.as_bytes();
+        if host.len() > u8::MAX as usize {
+            bail!("datagram host is longer than 255 bytes");
+        }
+        let mut buf = BytesMut::with_capacity(1 + host.len() + 2 + data.len());
+        buf.put_u8(host.len() as u8);
+        buf.extend_from_slice(host);
+        buf.put_u16(port);
+        buf.extend_from_slice(data);
+        Ok(Frame { stream_id, frame_type: FrameType::Datagram, payload: buf.freeze() })
+    }
+
+    /// Splits a `Datagram` payload into `(host, port, data)`.
+    pub fn decode_datagram(&self) -> Result<(String, u16, Bytes)> {
+        let payload = &self.payload;
+        let Some(&host_len) = payload.first() else { bail!("empty datagram payload") };
+        let host_end = 1 + host_len as usize;
+        if payload.len() < host_end + 2 {
+            bail!("datagram payload shorter than its address");
+        }
+        let host = std::str::from_utf8(&payload[1..host_end])?.to_owned();
+        let port = u16::from_be_bytes([payload[host_end], payload[host_end + 1]]);
+        Ok((host, port, payload.slice(host_end + 2..)))
+    }
+
     pub fn key_update(ephemeral_public_key: &[u8; 32]) -> Self {
         Frame {
             stream_id: CONTROL_STREAM,
             frame_type: FrameType::KeyUpdate,
             payload: Bytes::copy_from_slice(ephemeral_public_key),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datagram_round_trips_in_the_plugin_wire_format() {
+        let frame = Frame::datagram(7, "203.0.113.5", 53000, b"wg").unwrap();
+        // host_len || host || port BE || data
+        let mut expected = vec![11u8];
+        expected.extend_from_slice(b"203.0.113.5");
+        expected.extend_from_slice(&53000u16.to_be_bytes());
+        expected.extend_from_slice(b"wg");
+        assert_eq!(frame.payload.as_ref(), expected.as_slice());
+
+        let decoded = Frame::decode(&frame.encode()).unwrap();
+        assert_eq!(decoded.frame_type, FrameType::Datagram);
+        let (host, port, data) = decoded.decode_datagram().unwrap();
+        assert_eq!((host.as_str(), port, data.as_ref()), ("203.0.113.5", 53000, b"wg".as_ref()));
+    }
+
+    #[test]
+    fn udp_frame_type_bytes_match_the_plugin() {
+        assert_eq!(Frame::open_udp(1).encode()[4], 8);
+        assert_eq!(Frame::datagram(1, "h", 1, b"").unwrap().encode()[4], 9);
+    }
+
+    #[test]
+    fn malformed_datagram_is_rejected() {
+        let frame = Frame { stream_id: 1, frame_type: FrameType::Datagram, payload: Bytes::from_static(&[5, b'a']) };
+        assert!(frame.decode_datagram().is_err());
     }
 }
