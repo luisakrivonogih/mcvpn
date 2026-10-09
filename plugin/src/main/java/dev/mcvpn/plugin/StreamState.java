@@ -71,14 +71,20 @@ final class StreamState {
         }
 
         CompletableFuture.runAsync(() -> {
-            boolean upstreamEnabled = owner.plugin().getConfig().getBoolean("upstream.enabled", false);
+            var config = owner.plugin().getConfig();
+            boolean upstreamEnabled = config.getBoolean("upstream.enabled", false);
+            String upstreamHost = config.getString("upstream.host", "127.0.0.1");
             try {
-                Socket s = upstreamEnabled
-                        ? connectThroughUpstream(
-                                owner.plugin().getConfig().getString("upstream.host", "127.0.0.1"),
-                                owner.plugin().getConfig().getInt("upstream.port", 3128),
-                                host, port)
-                        : connectDirect(host, port);
+                Socket s;
+                if (!upstreamEnabled) {
+                    s = connectDirect(host, port);
+                } else if ("socks5".equalsIgnoreCase(config.getString("upstream.type", "http"))) {
+                    // Per-user: the upstream sees which tunnel user this is.
+                    s = Socks5Upstream.connect(upstreamHost, config.getInt("upstream.port", 1080),
+                            owner.userLabel(), host, port);
+                } else {
+                    s = connectThroughUpstream(upstreamHost, config.getInt("upstream.port", 3128), host, port);
+                }
                 onConnected(s, host, port);
             } catch (IOException e) {
                 owner.plugin().getLogger().warning(

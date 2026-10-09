@@ -31,6 +31,8 @@ final class UdpAssociationState {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Object socketLock = new Object();
     private DatagramSocket socket; // null until the first outbound datagram
+    // Set when datagrams go through a SOCKS5 upstream (upstream.type: socks5).
+    private Socks5Upstream.Association upstream;
     private volatile Thread readerThread;
 
     UdpAssociationState(PlayerMultiplex owner, int streamId) {
@@ -45,6 +47,16 @@ final class UdpAssociationState {
                 DatagramSocket s = ensureSocket();
                 if (s == null) {
                     return; // already closed
+                }
+                Socks5Upstream.Association via;
+                synchronized (socketLock) {
+                    via = upstream;
+                }
+                if (via != null) {
+                    // Names are resolved by the upstream, not here.
+                    byte[] wrapped = Socks5Upstream.wrap(host, port, data);
+                    s.send(new DatagramPacket(wrapped, wrapped.length, via.relay()));
+                    return;
                 }
                 InetAddress addr = InetAddress.getByName(host);
                 s.send(new DatagramPacket(data, data.length, addr, port));
@@ -63,6 +75,12 @@ final class UdpAssociationState {
                 return null;
             }
             if (socket == null) {
+                var config = owner.plugin().getConfig();
+                if (config.getBoolean("upstream.enabled", false)
+                        && "socks5".equalsIgnoreCase(config.getString("upstream.type", "http"))) {
+                    upstream = Socks5Upstream.associate(config.getString("upstream.host", "127.0.0.1"),
+                            config.getInt("upstream.port", 1080), owner.userLabel());
+                }
                 socket = new DatagramSocket();
                 Thread reader = new Thread(this::pumpTargetToPlayer,
                         "mcvpn-udp-" + owner.playerName() + "-" + streamId);
@@ -91,6 +109,20 @@ final class UdpAssociationState {
                         packet.getOffset() + packet.getLength());
                 String host = packet.getAddress().getHostAddress();
                 int port = packet.getPort();
+                Socks5Upstream.Association via;
+                synchronized (socketLock) {
+                    via = upstream;
+                }
+                if (via != null) {
+                    // Through an upstream, the real source is in the relay header.
+                    Socks5Upstream.Datagram d = Socks5Upstream.unwrap(data, data.length);
+                    if (d == null) {
+                        continue;
+                    }
+                    host = d.host();
+                    port = d.port();
+                    data = d.data();
+                }
                 if (!owner.sendFrame(Frame.datagram(streamId, host, port, data))) {
                     break;
                 }
@@ -112,6 +144,13 @@ final class UdpAssociationState {
         }
         if (s != null) {
             s.close();
+        }
+        Socks5Upstream.Association via;
+        synchronized (socketLock) {
+            via = upstream;
+        }
+        if (via != null) {
+            via.close();
         }
         Thread reader = readerThread;
         if (reader != null) {

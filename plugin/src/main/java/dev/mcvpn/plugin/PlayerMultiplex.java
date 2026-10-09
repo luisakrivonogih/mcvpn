@@ -72,6 +72,15 @@ final class PlayerMultiplex {
         return player.getName();
     }
 
+    /**
+     * The authenticated tunnel user's label (the panel's client ID), or
+     * null before the handshake. Upstreams that route per user key on it.
+     */
+    String userLabel() {
+        VpnUser user = vpnUser;
+        return user == null ? null : user.label();
+    }
+
     /** Whether this connection has completed the handshake. */
     boolean isActive() {
         return crypto.get() != null;
